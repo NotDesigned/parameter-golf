@@ -39,7 +39,7 @@ def _flash_attn_compat(q, k, v, causal=True):
     q, k, v = (x.transpose(1, 2) for x in (q, k, v))
     y = F.scaled_dot_product_attention(q, k, v, is_causal=causal, enable_gqa=True)
     return y.transpose(1, 2)  # back to [B, T, H, D]
-    
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -96,6 +96,7 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
+    rescale_resid = bool(int(os.environ.get("RESCALE_RESID", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
@@ -613,6 +614,7 @@ class Block(nn.Module):
         layer_idx: int = 0,
         ln_scale: bool = False,
         dtg: bool = False,
+        rescale_resid: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -623,6 +625,8 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.layer_idx = layer_idx
+        self.rescale_resid = rescale_resid
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
             nn.init.zeros_(self.dtg_gate.weight)
@@ -633,12 +637,20 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        layer_idx = self.layer_idx
+        if self.rescale_resid:
+            alpha = (layer_idx + 1) / (layer_idx + 2)
+            beta = 1 - alpha
+        else:
+            alpha = beta = 1.0
+        x_out = alpha * x_in + beta * self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
+        
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
         return x_out
+    
 class GPT(nn.Module):
     def __init__(
         self,
@@ -661,6 +673,7 @@ class GPT(nn.Module):
         rope_dims: int = 0,
         ln_scale: bool = False,
         dtg: bool = False,
+        rescale_resid: bool = False,
         ve_enabled: bool = False,
         ve_dim: int = 128,
         ve_layers: str = "9,10",
@@ -693,6 +706,7 @@ class GPT(nn.Module):
                     layer_idx=i,
                     ln_scale=ln_scale,
                     dtg=dtg,
+                    rescale_resid=rescale_resid,
                 )
                 for i in range(num_layers)
             ]
@@ -1063,6 +1077,7 @@ def main() -> None:
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
         dtg=args.dtg_enabled,
+        rescale_resid=rescale_resid,
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
@@ -1415,4 +1430,5 @@ def main() -> None:
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
+    
     main()
