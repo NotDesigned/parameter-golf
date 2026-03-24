@@ -1077,7 +1077,7 @@ def main() -> None:
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
         dtg=args.dtg_enabled,
-        rescale_resid=rescale_resid,
+        rescale_resid=args.rescale_resid,
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
